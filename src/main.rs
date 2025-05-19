@@ -1,5 +1,7 @@
 mod workout_activity;
 use blake3;
+use chrono::{Datelike, Duration, Utc};
+use csv::Writer;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rayon::prelude::*;
@@ -8,6 +10,7 @@ use smallstr::SmallString;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
+use std::error::Error;
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -41,6 +44,25 @@ fn get_file_hash(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     Ok(hash.to_hex().to_string())
 }
 
+fn is_in_last_12_months(date_str: &str) -> bool {
+    if date_str.len() < 7 {
+        return false;
+    }
+    let year: i32 = date_str[0..4].parse().unwrap_or(0);
+    let month: u32 = date_str[5..7].parse().unwrap_or(0);
+
+    let now = Utc::now();
+    let cutoff_year = (now - Duration::days(365)).year();
+    let cutoff_month = (now - Duration::days(365)).month();
+
+    if year > cutoff_year {
+        true
+    } else if year == cutoff_year {
+        month >= cutoff_month
+    } else {
+        false
+    }
+}
 fn try_load_cache(cache_dir: &Path, hash: &str) -> Option<String> {
     let cache_path = cache_dir.join(format!("{}.xml", hash));
     if cache_path.exists() {
@@ -83,7 +105,11 @@ fn read_export_xml(zip_path: &Path) -> Result<String, Box<dyn std::error::Error>
 fn parse_records(xml: &str, allowed_types: &HashSet<&str>) -> Vec<HealthRecord> {
     let allow_all = allowed_types.is_empty();
     let chunks: Vec<&str> = xml.split("<Record ").collect();
-    let ignored_metadata_keys: HashSet<&str> = ["HKAlgorithmVersion"].iter().copied().collect();
+    let metadata_keys_to_include: HashSet<&str> =
+        ["HKActivityType", "HKPhysicalEffortEstimationType"]
+            .iter()
+            .copied()
+            .collect();
 
     chunks
         .par_iter()
@@ -128,6 +154,16 @@ fn parse_records(xml: &str, allowed_types: &HashSet<&str>) -> Vec<HealthRecord> 
 
                                 if !should_parse {
                                     continue;
+                                }
+
+                                if key == b"startDate" {
+                                    if let Ok(v_str) = std::str::from_utf8(value_ref) {
+                                        if !is_in_last_12_months(v_str) {
+                                            should_parse = false;
+                                            continue;
+                                        }
+                                        start_date = Some(SmallString::from(v_str));
+                                    }
                                 }
 
                                 match key {
@@ -181,7 +217,7 @@ fn parse_records(xml: &str, allowed_types: &HashSet<&str>) -> Vec<HealthRecord> 
                                         value = SmallString::from(activity.to_string());
                                     }
                                 }
-                                if !ignored_metadata_keys.contains(key.as_str()) {
+                                if metadata_keys_to_include.contains(key.as_str()) {
                                     metadata.insert(key, value);
                                 }
                             }
@@ -214,16 +250,52 @@ fn parse_records(xml: &str, allowed_types: &HashSet<&str>) -> Vec<HealthRecord> 
         .collect()
 }
 
+fn write_csv(records: &[HealthRecord], path: &str) -> Result<(), Box<dyn Error>> {
+    let mut wtr = Writer::from_path(path)?;
+
+    wtr.write_record(&[
+        "record_type",
+        "value",
+        "unit",
+        "start_date",
+        "end_date",
+        "metadata",
+    ])?;
+
+    for rec in records {
+        let meta_str = serde_json::to_string(&rec.metadata).unwrap_or_default();
+
+        wtr.write_record(&[
+            rec.record_type.as_deref().unwrap_or(""),
+            rec.value
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+                .as_str(),
+            rec.unit.as_deref().unwrap_or(""),
+            rec.start_date.as_deref().unwrap_or(""),
+            rec.end_date.as_deref().unwrap_or(""),
+            &meta_str,
+        ])?;
+    }
+
+    wtr.flush()?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let zip_path = "./export.zip";
-    let output_path = "./output.json";
 
     let allowed_types: HashSet<&str> = [
+        "HKQuantityTypeIdentifierHeartRate",
         "HKQuantityTypeIdentifierRestingHeartRate",
         "HKQuantityTypeIdentifierPhysicalEffort",
         "HKQuantityTypeIdentifierActiveEnergyBurned",
         "HKQuantityTypeIdentifierDistanceWalkingRunning",
+        "HKQuantityTypeIdentifierStepCount",
+        "HKQuantityTypeIdentifierFlightsClimbed",
+        "HKCategoryTypeIdentifierSleepAnalysis",
+        "HKQuantityTypeIdentifierBodyMass",
     ]
     .iter()
     .copied()
@@ -236,13 +308,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_parse = Instant::now();
     let records = parse_records(&xml, &allowed_types);
     println!("Parsing XML took {:.2?}", t_parse.elapsed());
+    println!("Found {} records", records.len());
 
     let t_serialize = Instant::now();
     let json_output = serde_json::to_string_pretty(&records)?;
-    println!("Serialization took {:.2?}", t_serialize.elapsed());
+    fs::write("./output.json", json_output)?;
+    println!("JSON Serialization took {:.2?}", t_serialize.elapsed());
 
-    println!("Found {} records", records.len());
-    fs::write(output_path, json_output)?;
+    let t_csv = Instant::now();
+    write_csv(&records, "output.csv")?;
+    println!("CSV Serialization took {:.2?}", t_csv.elapsed());
 
     let duration = start.elapsed();
     println!("Done in {:?}", duration);
