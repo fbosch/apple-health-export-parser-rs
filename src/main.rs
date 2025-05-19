@@ -1,9 +1,11 @@
+mod workout_activity;
 use blake3;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use smallstr::SmallString;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -11,6 +13,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use workout_activity::WorkoutActivityType;
 use zip::ZipArchive;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -23,6 +26,7 @@ struct HealthRecord {
     start_date: Option<SmallString<[u8; 32]>>,
     #[serde(rename = "endDate")]
     end_date: Option<SmallString<[u8; 32]>>,
+    metadata: HashMap<SmallString<[u8; 16]>, SmallString<[u8; 32]>>,
 }
 
 fn get_cache_dir() -> PathBuf {
@@ -79,6 +83,7 @@ fn read_export_xml(zip_path: &Path) -> Result<String, Box<dyn std::error::Error>
 fn parse_records(xml: &str, allowed_types: &HashSet<&str>) -> Vec<HealthRecord> {
     let allow_all = allowed_types.is_empty();
     let chunks: Vec<&str> = xml.split("<Record ").collect();
+    let ignored_metadata_keys: HashSet<&str> = ["HKAlgorithmVersion"].iter().copied().collect();
 
     chunks
         .par_iter()
@@ -88,66 +93,105 @@ fn parse_records(xml: &str, allowed_types: &HashSet<&str>) -> Vec<HealthRecord> 
             let mut reader = Reader::from_str(&full_chunk);
             reader.config_mut().trim_text(true);
 
-            let mut buf = Vec::with_capacity(16 * 1024);
+            let mut buf = Vec::with_capacity(2048);
 
             let mut record_type = None;
             let mut value = None;
             let mut unit = None;
             let mut start_date = None;
             let mut end_date = None;
+
+            let mut metadata: HashMap<SmallString<[u8; 16]>, SmallString<[u8; 32]>> =
+                HashMap::new();
+
             let mut should_parse = allow_all;
 
             while let Ok(event) = reader.read_event_into(&mut buf) {
-                if let Event::Empty(ref e) = event {
-                    if e.name().as_ref() == b"Record" {
-                        for attr in e.attributes().flatten() {
-                            let key = attr.key.as_ref();
-                            let value_ref = attr.value.as_ref();
+                match event {
+                    Event::Empty(ref e) | Event::Start(ref e) => {
+                        if e.name().as_ref() == b"Record" {
+                            // Parse attributes from the <Record> tag
+                            for attr in e.attributes().flatten() {
+                                let key = attr.key.as_ref();
+                                let value_ref = attr.value.as_ref();
 
-                            if key == b"type" {
-                                if let Ok(v_str) = std::str::from_utf8(value_ref) {
-                                    record_type = Some(SmallString::from(v_str));
-                                    should_parse = allow_all || allowed_types.contains(v_str);
-                                    if !should_parse {
-                                        break;
+                                if key == b"type" {
+                                    if let Ok(v_str) = std::str::from_utf8(value_ref) {
+                                        record_type = Some(SmallString::from(v_str));
+                                        should_parse = allow_all || allowed_types.contains(v_str);
+                                        if !should_parse {
+                                            break;
+                                        }
                                     }
+                                    continue;
                                 }
-                                continue;
+
+                                if !should_parse {
+                                    continue;
+                                }
+
+                                match key {
+                                    b"value" => {
+                                        if let Ok(v_str) = std::str::from_utf8(value_ref) {
+                                            value = v_str.parse::<f64>().ok();
+                                        }
+                                    }
+                                    b"unit" => {
+                                        if let Ok(v_str) = std::str::from_utf8(value_ref) {
+                                            unit = Some(SmallString::from(v_str));
+                                        }
+                                    }
+                                    b"startDate" => {
+                                        if let Ok(v_str) = std::str::from_utf8(value_ref) {
+                                            start_date = Some(SmallString::from(v_str));
+                                        }
+                                    }
+                                    b"endDate" => {
+                                        if let Ok(v_str) = std::str::from_utf8(value_ref) {
+                                            end_date = Some(SmallString::from(v_str));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else if e.name().as_ref() == b"MetadataEntry" && should_parse {
+                            let mut key_opt: Option<SmallString<[u8; 16]>> = None;
+                            let mut value_opt: Option<SmallString<[u8; 32]>> = None;
+
+                            for attr in e.attributes().flatten() {
+                                match attr.key.as_ref() {
+                                    b"key" => {
+                                        let key_str =
+                                            std::str::from_utf8(attr.value.as_ref()).unwrap();
+                                        key_opt = Some(SmallString::from(key_str));
+                                    }
+                                    b"value" => {
+                                        let val_str =
+                                            std::str::from_utf8(attr.value.as_ref()).unwrap();
+                                        value_opt = Some(SmallString::from(val_str));
+                                    }
+                                    _ => {}
+                                }
                             }
 
-                            if !should_parse {
-                                continue;
-                            }
-
-                            match key {
-                                b"value" => {
-                                    if let Ok(v_str) = std::str::from_utf8(value_ref) {
-                                        value = v_str.parse::<f64>().ok();
+                            if let (Some(key), Some(mut value)) = (key_opt, value_opt) {
+                                if key.as_str() == "HKActivityType" {
+                                    if let Ok(code) = value.parse::<u32>() {
+                                        let activity = WorkoutActivityType::from_u32(code);
+                                        value = SmallString::from(activity.to_string());
                                     }
                                 }
-                                b"unit" => {
-                                    if let Ok(v_str) = std::str::from_utf8(value_ref) {
-                                        unit = Some(SmallString::from(v_str));
-                                    }
+                                if !ignored_metadata_keys.contains(key.as_str()) {
+                                    metadata.insert(key, value);
                                 }
-                                b"startDate" => {
-                                    if let Ok(v_str) = std::str::from_utf8(value_ref) {
-                                        start_date = Some(SmallString::from(v_str));
-                                    }
-                                }
-                                b"endDate" => {
-                                    if let Ok(v_str) = std::str::from_utf8(value_ref) {
-                                        end_date = Some(SmallString::from(v_str));
-                                    }
-                                }
-                                _ => {}
                             }
                         }
                     }
-                }
-
-                if matches!(event, Event::Eof) {
-                    break;
+                    Event::End(ref e) if e.name().as_ref() == b"Record" => {
+                        break;
+                    }
+                    Event::Eof => break,
+                    _ => {}
                 }
 
                 buf.clear();
@@ -160,12 +204,13 @@ fn parse_records(xml: &str, allowed_types: &HashSet<&str>) -> Vec<HealthRecord> 
                     unit,
                     start_date,
                     end_date,
+                    metadata,
                 })
             } else {
                 None
             }
         })
-        .filter_map(|r| r) // Remove None values
+        .filter_map(|r| r)
         .collect()
 }
 
@@ -174,10 +219,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let zip_path = "./export.zip";
     let output_path = "./output.json";
 
-    let allowed_types: HashSet<&str> = ["HKQuantityTypeIdentifierRestingHeartRate"]
-        .iter()
-        .copied()
-        .collect();
+    let allowed_types: HashSet<&str> = [
+        "HKQuantityTypeIdentifierRestingHeartRate",
+        "HKQuantityTypeIdentifierPhysicalEffort",
+        "HKQuantityTypeIdentifierActiveEnergyBurned",
+        "HKQuantityTypeIdentifierDistanceWalkingRunning",
+    ]
+    .iter()
+    .copied()
+    .collect();
 
     let t_read = Instant::now();
     let xml = read_export_xml(std::path::Path::new(zip_path))?;
@@ -193,6 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Found {} records", records.len());
     fs::write(output_path, json_output)?;
+
     let duration = start.elapsed();
     println!("Done in {:?}", duration);
 
