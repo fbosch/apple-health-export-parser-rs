@@ -5,6 +5,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use smallstr::SmallString;
 use std::collections::HashSet;
+use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -25,9 +26,9 @@ struct HealthRecord {
 }
 
 fn get_cache_dir() -> PathBuf {
-    let base_cache = dirs::cache_dir()
-        .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"));
-    base_cache.join("apple_health_export_parser_rs")
+    let mut temp_dir = env::temp_dir();
+    temp_dir.push("apple_health_export_parser_rs");
+    temp_dir
 }
 
 fn get_file_hash(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
