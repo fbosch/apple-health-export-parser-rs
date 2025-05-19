@@ -1,3 +1,4 @@
+use blake3;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rayon::prelude::*;
@@ -7,6 +8,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use zip::ZipArchive;
 
@@ -22,16 +24,53 @@ struct HealthRecord {
     end_date: Option<SmallString<[u8; 32]>>,
 }
 
-fn read_export_xml(zip_path: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn get_cache_dir() -> PathBuf {
+    let base_cache = dirs::cache_dir()
+        .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"));
+    base_cache.join("apple_health_export_parser_rs")
+}
+
+fn get_file_hash(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let data = fs::read(path)?;
+    let hash = blake3::hash(&data);
+    Ok(hash.to_hex().to_string())
+}
+
+fn try_load_cache(cache_dir: &Path, hash: &str) -> Option<String> {
+    let cache_path = cache_dir.join(format!("{}.xml", hash));
+    if cache_path.exists() {
+        fs::read_to_string(cache_path).ok()
+    } else {
+        None
+    }
+}
+
+fn save_cache(cache_dir: &Path, hash: &str, data: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(cache_dir)?;
+    let cache_path = cache_dir.join(format!("{}.xml", hash));
+    fs::write(cache_path, data)?;
+    Ok(())
+}
+
+fn read_export_xml(zip_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let cache_dir = get_cache_dir();
+    let hash = get_file_hash(zip_path)?;
+
+    if let Some(cached_xml) = try_load_cache(&cache_dir, &hash) {
+        println!("Loaded XML from cache");
+        return Ok(cached_xml);
+    }
+
     let file = File::open(zip_path)?;
     let mut archive = ZipArchive::new(BufReader::new(file))?;
-
     let mut export_file = archive
         .by_name("apple_health_export/export.xml")
         .map_err(|_| "Could not find 'export.xml' in the archive")?;
 
     let mut contents = String::new();
     export_file.read_to_string(&mut contents)?;
+
+    save_cache(&cache_dir, &hash, &contents)?;
 
     Ok(contents)
 }
@@ -140,7 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let t_read = Instant::now();
-    let xml = read_export_xml(zip_path)?;
+    let xml = read_export_xml(std::path::Path::new(zip_path))?;
     println!("Reading XML took {:.2?}", t_read.elapsed());
 
     let t_parse = Instant::now();
