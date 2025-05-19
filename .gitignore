@@ -15,6 +15,7 @@ workout-routes/
 route_*.gpx
 electrocardiograms/
 ecg_*.csv
+output.json
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
@@ -29,3 +30,6 @@ ecg_*.csv
 # Added by cargo
 
 /target
+
+# MacOS
+.DS_Store
