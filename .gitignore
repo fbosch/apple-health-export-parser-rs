@@ -7,7 +7,7 @@ target/
 **/*.rs.bk
 
 # apple health export
-export.zip
+export.zip*
 export.xml
 apple_health_export/
 export_cda.xml

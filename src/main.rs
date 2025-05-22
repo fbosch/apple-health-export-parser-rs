@@ -24,7 +24,7 @@ struct HealthRecord {
     #[serde(rename = "type")]
     record_type: Option<SmallString<[u8; 32]>>,
     unit: Option<SmallString<[u8; 16]>>,
-    value: Option<f64>,
+    value: Option<SmallString<[u8; 64]>>,
     #[serde(rename = "startDate")]
     start_date: Option<SmallString<[u8; 32]>>,
     #[serde(rename = "endDate")]
@@ -63,6 +63,7 @@ fn is_in_last_12_months(date_str: &str) -> bool {
         false
     }
 }
+
 fn try_load_cache(cache_dir: &Path, hash: &str) -> Option<String> {
     let cache_path = cache_dir.join(format!("{}.xml", hash));
     if cache_path.exists() {
@@ -136,7 +137,6 @@ fn parse_records(xml: &str, allowed_types: &HashSet<&str>) -> Vec<HealthRecord> 
                 match event {
                     Event::Empty(ref e) | Event::Start(ref e) => {
                         if e.name().as_ref() == b"Record" {
-                            // Parse attributes from the <Record> tag
                             for attr in e.attributes().flatten() {
                                 let key = attr.key.as_ref();
                                 let value_ref = attr.value.as_ref();
@@ -169,7 +169,7 @@ fn parse_records(xml: &str, allowed_types: &HashSet<&str>) -> Vec<HealthRecord> 
                                 match key {
                                     b"value" => {
                                         if let Ok(v_str) = std::str::from_utf8(value_ref) {
-                                            value = v_str.parse::<f64>().ok();
+                                            value = Some(SmallString::from(v_str));
                                         }
                                     }
                                     b"unit" => {
@@ -267,10 +267,7 @@ fn write_csv(records: &[HealthRecord], path: &str) -> Result<(), Box<dyn Error>>
 
         wtr.write_record(&[
             rec.record_type.as_deref().unwrap_or(""),
-            rec.value
-                .map(|v| v.to_string())
-                .unwrap_or_default()
-                .as_str(),
+            rec.value.as_deref().unwrap_or(""),
             rec.unit.as_deref().unwrap_or(""),
             rec.start_date.as_deref().unwrap_or(""),
             rec.end_date.as_deref().unwrap_or(""),
@@ -288,14 +285,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let allowed_types: HashSet<&str> = [
         "HKQuantityTypeIdentifierHeartRate",
+        "HKCategoryTypeIdentifierHighHeartRateEvent",
         "HKQuantityTypeIdentifierRestingHeartRate",
         "HKQuantityTypeIdentifierPhysicalEffort",
+        "HKQuantityTypeIdentifierBasalEnergyBurned",
         "HKQuantityTypeIdentifierActiveEnergyBurned",
         "HKQuantityTypeIdentifierDistanceWalkingRunning",
+        "HKQuantityTypeIdentifierWalkingSpeed",
+        "HKQuantityTypeIdentifierAppleStandTime",
+        "HKQuantityTypeIdentifierAppleExerciseTime",
+        "HKQuantityTypeIdentifierWalkingStepLength",
         "HKQuantityTypeIdentifierStepCount",
         "HKQuantityTypeIdentifierFlightsClimbed",
         "HKCategoryTypeIdentifierSleepAnalysis",
         "HKQuantityTypeIdentifierBodyMass",
+        "HKCategoryTypeIdentifierToothbrushingEvent",
+        "HKQuantityTypeIdentifierSixMinuteWalkTestDistance",
+        "HKQuantityTypeIdentifierDietaryCaffeine",
+        "HKQuantityTypeIdentifierDietaryWater",
     ]
     .iter()
     .copied()
